@@ -1,6 +1,6 @@
 # djangraphberry
 
-A Django service that aggregates two public financial data sources behind a single API, exposed as both a versioned REST interface and a GraphQL endpoint, with a React client. Everything runs locally with Docker Compose.
+A Django service that aggregates two public financial data sources behind a single API, exposed as both a versioned REST interface and a GraphQL endpoint, with a React client. Every lookup it answers is recorded to PostgreSQL. Everything runs locally with Docker Compose.
 
 ## What it does
 
@@ -22,14 +22,15 @@ On top of that data it answers questions that need both providers at once, such 
                       │ keyed client-side cache      │
                       └──────────────┬───────────────┘
                          /graphql, /api proxied
-                      ┌──────────────▼───────────────┐
-                      │ Django :8000                 │
-                      │  ┌────────────┬────────────┐ │
-                      │  │ DRF        │ Strawberry │ │
-                      │  │ /api/v1/   │ /graphql/  │ │
-                      │  └──────┬─────┴─────┬──────┘ │
-                      │     markets.cache            │
-                      │     markets.clients          │
+                      ┌──────────────▼───────────────┐     ┌────────────┐
+                      │ Django :8000                 │     │ PostgreSQL │
+                      │  ┌────────────┬────────────┐ │     │ audit log  │
+                      │  │ DRF        │ Strawberry │ │     └──────▲─────┘
+                      │  │ /api/v1/   │ /graphql/  │ │            │
+                      │  └──────┬─────┴─────┬──────┘ │            │
+                      │     markets.cache            │            │
+                      │     markets.clients          │            │
+                      │     markets.audit ───────────┼────────────┘
                       └──────────────┬───────────────┘
                      ┌───────────────┴───────────────┐
                      ▼                               ▼
@@ -46,9 +47,11 @@ Both API surfaces are thin layers over one shared client module, so they always 
 - **`markets/exceptions.py`** — a custom DRF exception handler that renders every error as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details, plus the `UpstreamUnavailable` (502) exception that upstream failures map to.
 - **`markets/schema.py`** — the Strawberry GraphQL schema: code-first types, root query fields, and a nested `converted` resolver that combines both providers.
 - **`markets/cache.py`** — the caching layer: a `@cached` decorator applied to the client functions, a per-request freshness ledger, and the middleware and DRF mixin that translate that freshness into HTTP cache headers.
+- **`markets/models.py`** — `PriceLookup`, the single persisted model: one row per price lookup answered.
+- **`markets/audit.py`** — a per-request ledger of lookups and the middleware that writes it, keeping persistence out of the views and resolvers.
 - **`config/`** — settings, URL routing and the WSGI/ASGI entry points.
 
-No database models are involved. Django's ORM is unused except for its built-in apps; all data is fetched live from the upstream providers.
+Market data itself is never stored. It is fetched live from the upstream providers and cached in memory; the database holds only the audit log and Django's built-in tables.
 
 ## REST API
 
@@ -137,6 +140,21 @@ Upstream *failures* are never cached, so a rate-limit response or timeout does n
 
 The cache backend is `LocMemCache`, which is per-process: under multiple workers each holds its own copy. Production would point `CACHES` at Redis; no application code changes.
 
+## Audit log
+
+Every price lookup the service answers is recorded in PostgreSQL as a `PriceLookup` row: when it happened, which surface served it, the coin, its price and 24-hour change, and — when the client asked for a conversion — the target currency, the converted price and the date of the rates used. That is the same set of facts the client table displays, plus a timestamp.
+
+The write is deferred. GraphQL resolves `converted` as a child of `cryptoPrice`, so at the moment a price is known it is not yet clear whether a conversion was requested. Views and resolvers therefore *note* what they answered into a `ContextVar` ledger — the same mechanism the freshness tracking uses — and `AuditMiddleware` writes the whole ledger in one `bulk_create` at the end of the request. One lookup becomes one row; a conversion into several currencies becomes one row each.
+
+Two consequences worth being explicit about:
+
+- **Cache hits are logged.** The recording happens in the views and resolvers, outside the `@cached` client functions, because the log answers "what were clients told" rather than "what did we ask upstream". Repeated requests inside a TTL produce repeated rows and no upstream traffic.
+- **Failed lookups are not logged.** Recording happens after the not-found branch, so the table contains answers, not attempts.
+
+An audit write that fails is logged and swallowed rather than turned into a `500`, on the grounds that losing a row about a read-only lookup is less harmful than failing the lookup. A log with compliance weight would want the opposite trade.
+
+`PriceLookup` is registered in the Django admin as read-only, with filters on source, coin and currency.
+
 ## Frontend
 
 `frontend/` holds a React 19 + TypeScript application built with Vite. In development it runs in its own container and proxies `/graphql` and `/api` to the Django service over the Compose network, so the browser makes same-origin requests only and no CORS configuration is required.
@@ -148,6 +166,25 @@ The client queries the GraphQL endpoint for a market snapshot — a cryptocurren
 - A refresh control bypasses the cache on demand, keeping the current row visible until new data arrives.
 - Each result is labelled with the time it was fetched, so a cached value is never mistaken for a live one.
 
+## Tests
+
+```bash
+docker compose exec web python manage.py test
+```
+
+49 tests across four modules in `markets/tests/`, covering both API surfaces, the caching layer and the audit log.
+
+The upstream providers are stubbed at `httpx.get` — the outermost boundary of the project — rather than at the client functions. Tests therefore exercise the real URL building, status handling, parsing, caching and error mapping; only the network is fake. `markets/tests/stubs.py` holds the canned payloads, counts the requests that reach it so tests can assert a cache hit made none, and has a switch for simulating an unreachable provider.
+
+| Module | Covers |
+| --- | --- |
+| `test_rest.py` | Response shapes, status codes, problem details, `Allow` and `Vary` headers, versioning, `Cache-Control` and `304` revalidation |
+| `test_graphql.py` | Queries against both providers, null-on-missing, error `extensions.code`, partial success, and that Frankfurter is only called when `converted` is selected |
+| `test_cache.py` | The `@cached` decorator's hits, key separation, negative caching, never caching failures, and the freshness ledger |
+| `test_audit.py` | One row per lookup, one per target currency, cache hits still logged, failures not logged, and a failed write not breaking the response |
+
+The test runner creates and drops a separate `test_djangraphberry` database, so running the suite never touches development data.
+
 ## Running locally
 
 Requirements: Docker Desktop.
@@ -157,12 +194,33 @@ Requirements: Docker Desktop.
    ```
    DJANGO_SECRET_KEY=<any long random string>
    DJANGO_DEBUG=1
+   POSTGRES_DB=djangraphberry
+   POSTGRES_USER=djangraphberry
+   POSTGRES_PASSWORD=<any password>
+   POSTGRES_HOST=db
+   POSTGRES_PORT=5432
    ```
 
-2. Start both services:
+   One file feeds both services: Compose passes the `POSTGRES_*` values to the database image, which uses them to initialize the cluster, and Django reads the same values to connect. They cannot drift apart.
+
+2. Start all three services:
 
    ```bash
    docker compose up --build
+   ```
+
+   The `web` service waits on the database's `pg_isready` healthcheck, not merely on its container starting, so Django never opens its first connection too early.
+
+3. Apply migrations:
+
+   ```bash
+   docker compose exec web python manage.py migrate
+   ```
+
+4. Optionally create an admin login to browse the audit log:
+
+   ```bash
+   docker compose exec web python manage.py createsuperuser
    ```
 
 | URL | Service |
@@ -170,13 +228,20 @@ Requirements: Docker Desktop.
 | http://localhost:5173 | React client |
 | http://localhost:8000/api/v1/ | REST API (browsable) |
 | http://localhost:8000/graphql/ | GraphiQL |
+| http://localhost:8000/admin/ | Django admin (audit log) |
 
 Source directories are bind-mounted, so Django's auto-reloader and Vite's hot module replacement both pick up edits without a rebuild. Rebuild (`docker compose build`) only after changing `requirements.txt` or `frontend/package.json`.
+
+Database contents live in the `postgres-data` named volume and survive `docker compose down`. `docker compose down -v` destroys them, including the admin user; the Postgres image only runs its initialization while the volume is empty, so changing `POSTGRES_USER` or `POSTGRES_PASSWORD` later requires that reset.
 
 ### Common commands
 
 ```bash
-docker compose run --rm web python manage.py shell     # Django shell
+docker compose exec web python manage.py shell         # Django shell
+docker compose exec web python manage.py makemigrations
+docker compose exec web python manage.py migrate
+docker compose exec web python manage.py test          # see Tests, above
+docker compose exec db psql -U djangraphberry -d djangraphberry   # SQL prompt
 docker compose build web                               # after a dependency change
 docker compose logs -f frontend                        # follow one service's logs
 ```
@@ -187,6 +252,8 @@ docker compose logs -f frontend                        # follow one service's lo
 | --- | --- | --- |
 | `DJANGO_SECRET_KEY` | environment (required) | Django cryptographic signing |
 | `DJANGO_DEBUG` | environment | `1` enables debug mode |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | environment (required) | Database name and credentials, shared by the `db` and `web` services |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | environment | Default to `db` and `5432`, the Compose service address |
 | `FRANKFURTER_BASE_URL` | `config/settings.py` | Exchange-rate provider |
 | `COINGECKO_BASE_URL` | `config/settings.py` | Crypto-price provider |
 | `UPSTREAM_TIMEOUT_SECONDS` | `config/settings.py` | Per-request timeout for outbound calls |
@@ -198,6 +265,8 @@ docker compose logs -f frontend                        # follow one service's lo
 
 The TTL settings are read per call rather than at import, so `override_settings` adjusts them in tests; a TTL of `0` disables caching for that data without a separate code path.
 
+Database credentials use `os.environ[...]` so a missing value fails at startup rather than silently falling back; host and port have defaults, being infrastructure rather than secrets. The connection is configured with `CONN_MAX_AGE` so it is reused across requests, and `CONN_HEALTH_CHECKS` so a connection left stale by a database restart is replaced rather than handed to a request.
+
 Upstream base URLs are settings rather than constants so they can be pointed at a stub server in tests.
 
 Neither provider requires an API key. CoinGecko's keyless tier is rate limited and returns `429` under load, which the service surfaces as `502` / `UPSTREAM_UNAVAILABLE`; a free CoinGecko demo key can be supplied to raise that limit.
@@ -206,7 +275,7 @@ Neither provider requires an API key. CoinGecko's keyless tier is rate limited a
 
 ```
 .
-├── compose.yaml          Two services: web (Django), frontend (Vite)
+├── compose.yaml          Three services: db (PostgreSQL), web (Django), frontend (Vite)
 ├── Dockerfile            Django image
 ├── config/               Settings, root URLconf, WSGI/ASGI
 │   ├── settings.py
@@ -218,7 +287,12 @@ Neither provider requires an API key. CoinGecko's keyless tier is rate limited a
 │   ├── views.py          DRF viewsets and views
 │   ├── exceptions.py     Domain exceptions and problem-details error handling
 │   ├── schema.py         Strawberry GraphQL schema
-│   └── urls.py           Router registrations
+│   ├── models.py         PriceLookup, the audit-log table
+│   ├── audit.py          Per-request lookup ledger and its middleware
+│   ├── admin.py          Read-only admin for the audit log
+│   ├── migrations/
+│   ├── urls.py           Router registrations
+│   └── tests/            Suites for REST, GraphQL, caching and the audit log
 ├── requirements.txt
 └── frontend/             React + TypeScript client (Vite)
     ├── Dockerfile
@@ -232,6 +306,7 @@ Neither provider requires an API key. CoinGecko's keyless tier is rate limited a
 ## Planned work
 
 - `504` for upstream timeouts, distinct from `502` for upstream errors.
-- Test suites for both API surfaces, with the upstream providers stubbed.
 - Deduplication of concurrent identical upstream requests, so a cold cache under load produces one call rather than several.
 - `400` rather than `404` when the crypto endpoint receives an unsupported `?currency=`.
+- A retention policy for the audit table, since it grows without bound.
+- Exchange-rate lookups in the audit log; only crypto lookups are recorded today, because those are what the client table shows.
