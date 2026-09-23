@@ -1,12 +1,9 @@
 from datetime import date
 from decimal import Decimal
-
 import strawberry
 from graphql import GraphQLError
-
-from . import clients
 from .serializers import CURRENCY_CODE
-
+from . import audit, clients
 
 def _check_codes(*codes: str) -> None:
     invalid = [code for code in codes if not CURRENCY_CODE.match(code)]
@@ -70,10 +67,17 @@ class CryptoPrice:
             )
         except clients.UpstreamError:
             raise _upstream_error()
-        return [
+        converted = [
             ConvertedPrice(currency=code, price=self.price * rate)
             for code, rate in rates.rates.items()
         ]
+        audit.record_conversions(
+            coin_id=self.id,
+            base_currency=self.currency,
+            rate_date=rates.date,
+            conversions=[(c.currency, c.price) for c in converted],
+        )
+        return converted
 
 
 # --- Root query ---
@@ -115,6 +119,13 @@ class Query:
             return None
         except clients.UpstreamError:
             raise _upstream_error()
+        audit.record_price(
+            source="graphql",
+            coin_id=result.coin_id,
+            base_currency=result.currency,
+            price=result.price,
+            change_24h_percent=result.change_24h_percent,
+        )
         return CryptoPrice(
             id=result.coin_id,
             currency=result.currency,

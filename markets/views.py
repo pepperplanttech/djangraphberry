@@ -11,7 +11,7 @@ from .serializers import (
     ExchangeRatesQuerySerializer,
     ExchangeRatesSerializer,
 )
-
+from . import audit, clients
 
 class CurrencyViewSet(CacheControlMixin, viewsets.ViewSet):
     """Fiat currencies supported for exchange rates (source: Frankfurter / ECB)."""
@@ -66,4 +66,12 @@ class CryptocurrencyViewSet(CacheControlMixin, viewsets.ViewSet):
             price = clients.fetch_crypto_price(coin_id, currency)
         except clients.NotFoundError:
             raise NotFound(f"No price found for '{coin_id}' in '{currency}'.")
+
+        audit.record_price(
+            source="rest",
+            coin_id=price.coin_id,
+            base_currency=price.currency,
+            price=price.price,
+            change_24h_percent=price.change_24h_percent,
+        )
         return Response(CryptoPriceSerializer(price).data)
