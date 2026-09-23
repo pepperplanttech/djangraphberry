@@ -19,6 +19,7 @@ On top of that data it answers questions that need both providers at once, such 
                       ┌──────────────────────────────┐
   browser  ─────────► │ React + TypeScript (Vite)    │
                       │ dev server :5173             │
+                      │ keyed client-side cache      │
                       └──────────────┬───────────────┘
                          /graphql, /api proxied
                       ┌──────────────▼───────────────┐
@@ -27,6 +28,7 @@ On top of that data it answers questions that need both providers at once, such 
                       │  │ DRF        │ Strawberry │ │
                       │  │ /api/v1/   │ /graphql/  │ │
                       │  └──────┬─────┴─────┬──────┘ │
+                      │     markets.cache            │
                       │     markets.clients          │
                       └──────────────┬───────────────┘
                      ┌───────────────┴───────────────┐
@@ -34,7 +36,7 @@ On top of that data it answers questions that need both providers at once, such 
                Frankfurter                      CoinGecko
 ```
 
-Both API surfaces are thin layers over one shared client module, so they always return the same data and enforce the same validation rules.
+Both API surfaces are thin layers over one shared client module, so they always return the same data, enforce the same validation rules, and share one cache.
 
 ### Layers
 
@@ -43,6 +45,7 @@ Both API surfaces are thin layers over one shared client module, so they always 
 - **`markets/views.py`** — DRF viewsets and views. They contain no HTTP-client code and no error-response construction.
 - **`markets/exceptions.py`** — a custom DRF exception handler that renders every error as [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details, plus the `UpstreamUnavailable` (502) exception that upstream failures map to.
 - **`markets/schema.py`** — the Strawberry GraphQL schema: code-first types, root query fields, and a nested `converted` resolver that combines both providers.
+- **`markets/cache.py`** — the caching layer: a `@cached` decorator applied to the client functions, a per-request freshness ledger, and the middleware and DRF mixin that translate that freshness into HTTP cache headers.
 - **`config/`** — settings, URL routing and the WSGI/ASGI entry points.
 
 No database models are involved. Django's ORM is unused except for its built-in apps; all data is fetched live from the upstream providers.
@@ -66,6 +69,8 @@ Design characteristics:
 - Status codes distinguish client error (`400` for an invalid or unsupported parameter), missing resource (`404`), and upstream failure (`502`).
 - Errors use a single format, `application/problem+json`, with per-field messages under `errors` for validation failures.
 - Monetary values are serialized as strings to preserve decimal precision.
+- Successful responses carry `Cache-Control: public, max-age=<remaining>` and an `ETag`, so clients and intermediaries can avoid or revalidate requests. Errors and the browsable HTML variant are `no-store`.
+- `Vary: Accept` is set, because the same URL serves JSON or HTML depending on content negotiation.
 
 A browsable HTML version of every endpoint is available in a browser via DRF's browsable API renderer.
 
@@ -111,11 +116,37 @@ Design characteristics:
 - Root fields are nullable so that one failing field does not discard the rest of a multi-field response.
 - Currency-code validation is shared with the REST layer.
 
+## Caching
+
+Upstream responses are cached in three layers, each with a distinct responsibility.
+
+**Server-side, in `markets/cache.py`.** A `@cached("<TTL setting>")` decorator wraps each client function, keyed on its arguments, storing the parsed dataclass rather than the raw HTTP response. Because every outbound call goes through those functions, REST and GraphQL share one cache and one set of TTLs. Durations follow how fast each source actually changes:
+
+| Data | TTL | Rationale |
+| --- | --- | --- |
+| Currency list | 24 hours | Effectively static |
+| Exchange rates | 1 hour | ECB publishes once per working day |
+| Crypto prices | 60 seconds | CoinGecko's own data is about a minute fresh |
+| Not-found results | 30 seconds | Keeps a bad identifier from reaching the provider repeatedly |
+
+Upstream *failures* are never cached, so a rate-limit response or timeout does not persist past the request that hit it.
+
+**HTTP freshness.** A `ContextVar`-scoped ledger records the expiry of every cache entry a request touched. The response then advertises the *remaining* life of the shortest-lived one — not the full TTL — as `max-age`, so a client can never be staler than the server intended. The REST endpoints set this alongside `public` and an `ETag`; `FreshnessMiddleware` supplies it for the GraphQL endpoint, which no HTTP cache would honor on its own since the queries are `POST`.
+
+**Client-side.** The React client keeps its own keyed, in-memory cache and expires entries using the `max-age` the server reported. It holds no TTL of its own, which is what keeps the two layers from disagreeing.
+
+The cache backend is `LocMemCache`, which is per-process: under multiple workers each holds its own copy. Production would point `CACHES` at Redis; no application code changes.
+
 ## Frontend
 
 `frontend/` holds a React 19 + TypeScript application built with Vite. In development it runs in its own container and proxies `/graphql` and `/api` to the Django service over the Compose network, so the browser makes same-origin requests only and no CORS configuration is required.
 
-The client queries the GraphQL endpoint for a market snapshot — a cryptocurrency's price, its 24-hour change, and that price converted into a selected fiat currency — and renders it as a formatted table.
+The client queries the GraphQL endpoint for a market snapshot — a cryptocurrency's price, its 24-hour change, and that price converted into a selected fiat currency — and renders it as a formatted table. A cryptocurrency dropdown offers a fixed set of coins; the fiat dropdown is populated from the `currencies` query, so it always reflects what the upstream provider actually supports.
+
+- Snapshots are cached in memory by `(coin, currency)` and expire on the server-supplied `max-age`, so revisiting a pair costs no request.
+- The cache lives outside React and is read through `useSyncExternalStore`, rather than being mirrored into component state.
+- A refresh control bypasses the cache on demand, keeping the current row visible until new data arrives.
+- Each result is labelled with the time it was fetched, so a cached value is never mistaken for a live one.
 
 ## Running locally
 
@@ -159,6 +190,13 @@ docker compose logs -f frontend                        # follow one service's lo
 | `FRANKFURTER_BASE_URL` | `config/settings.py` | Exchange-rate provider |
 | `COINGECKO_BASE_URL` | `config/settings.py` | Crypto-price provider |
 | `UPSTREAM_TIMEOUT_SECONDS` | `config/settings.py` | Per-request timeout for outbound calls |
+| `CACHES` | `config/settings.py` | Cache backend (`LocMemCache` in development) |
+| `CURRENCIES_CACHE_SECONDS` | `config/settings.py` | TTL for the supported-currency list |
+| `EXCHANGE_RATE_CACHE_SECONDS` | `config/settings.py` | TTL for exchange rates |
+| `CRYPTO_CACHE_SECONDS` | `config/settings.py` | TTL for crypto prices |
+| `NOT_FOUND_CACHE_SECONDS` | `config/settings.py` | TTL for cached not-found results |
+
+The TTL settings are read per call rather than at import, so `override_settings` adjusts them in tests; a TTL of `0` disables caching for that data without a separate code path.
 
 Upstream base URLs are settings rather than constants so they can be pointed at a stub server in tests.
 
@@ -174,10 +212,11 @@ Neither provider requires an API key. CoinGecko's keyless tier is rate limited a
 │   ├── settings.py
 │   └── urls.py           /admin/, /api/<version>/, /graphql/
 ├── markets/              The application
-│   ├── clients.py        Upstream HTTP clients and domain exceptions
+│   ├── clients.py        Upstream HTTP clients
+│   ├── cache.py          Caching decorator, freshness ledger, HTTP cache headers
 │   ├── serializers.py    Input validation and output shaping
 │   ├── views.py          DRF viewsets and views
-│   ├── exceptions.py     Problem-details error handling
+│   ├── exceptions.py     Domain exceptions and problem-details error handling
 │   ├── schema.py         Strawberry GraphQL schema
 │   └── urls.py           Router registrations
 ├── requirements.txt
@@ -185,10 +224,14 @@ Neither provider requires an API key. CoinGecko's keyless tier is rate limited a
     ├── Dockerfile
     ├── vite.config.ts    Dev-server proxy to the Django service
     └── src/
+        ├── App.tsx       Controls, snapshot table, refresh
+        ├── api.ts        GraphQL queries and freshness parsing
+        └── cache.ts      Keyed client-side cache
 ```
 
 ## Planned work
 
-- Response caching for upstream calls, to cut latency and stay inside CoinGecko's rate limit.
 - `504` for upstream timeouts, distinct from `502` for upstream errors.
 - Test suites for both API surfaces, with the upstream providers stubbed.
+- Deduplication of concurrent identical upstream requests, so a cold cache under load produces one call rather than several.
+- `400` rather than `404` when the crypto endpoint receives an unsupported `?currency=`.
