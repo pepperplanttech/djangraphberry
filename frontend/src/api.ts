@@ -20,11 +20,24 @@ type GraphQLResponse<T> = {
   errors?: { message: string }[]
 }
 
+/** A payload plus the freshness the server advertised for it. */
+export type Fresh<T> = {
+  data: T
+  maxAge: number | null
+  fetchedAt: number
+}
+
+function parseMaxAge(header: string | null): number | null {
+  if (!header) return null
+  const match = /max-age=(\d+)/i.exec(header)
+  return match ? Number(match[1]) : null
+}
+
 export async function graphqlRequest<T>(
   query: string,
   variables: Record<string, unknown> = {},
   signal?: AbortSignal,
-): Promise<T> {
+): Promise<Fresh<T>> {
   const response = await fetch('/graphql/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -44,7 +57,11 @@ export async function graphqlRequest<T>(
   if (!result.data) {
     throw new Error('The server returned no data.')
   }
-  return result.data
+  return {
+    data: result.data,
+    maxAge: parseMaxAge(response.headers.get('Cache-Control')),
+    fetchedAt: Date.now(),
+  }
 }
 
 export const MARKET_SNAPSHOT_QUERY = `
@@ -68,7 +85,7 @@ export function fetchMarketSnapshot(
   coinId: string,
   currency: string,
   signal?: AbortSignal,
-): Promise<MarketSnapshot> {
+): Promise<Fresh<MarketSnapshot>> {
   return graphqlRequest<MarketSnapshot>(MARKET_SNAPSHOT_QUERY, { coinId, currency }, signal)
 }
 
@@ -91,6 +108,6 @@ export const CURRENCIES_QUERY = `
 `
 
 export async function fetchCurrencies(signal?: AbortSignal): Promise<Currency[]> {
-  const data = await graphqlRequest<CurrenciesData>(CURRENCIES_QUERY, {}, signal)
+  const { data } = await graphqlRequest<CurrenciesData>(CURRENCIES_QUERY, {}, signal)
   return data.currencies ?? []
 }

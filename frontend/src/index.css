@@ -56,3 +56,17 @@ td.numeric {
 
 td.up { color: #15803d; }
 td.down { color: #b91c1c; }
+
+.controls button {
+  font: inherit;
+  padding: 0.35rem 0.9rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
