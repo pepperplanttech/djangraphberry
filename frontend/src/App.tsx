@@ -1,122 +1,150 @@
-import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import './App.css'
+import { useEffect, useState } from 'react'
+import {
+  fetchCurrencies,
+  fetchMarketSnapshot,
+  type Currency,
+  type MarketSnapshot,
+} from './api'
 
-function App() {
-  const [count, setCount] = useState(0)
+const COINS = [
+  { id: 'bitcoin', label: 'Bitcoin' },
+  { id: 'ethereum', label: 'Ethereum' },
+  { id: 'solana', label: 'Solana' },
+]
 
-  return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Lets Get it Started!</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+const BASE_CURRENCY = 'USD'
 
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+function isAbort(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError'
 }
 
-export default App
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function formatMoney(amount: string, currency: string): string {
+  return new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency,
+    maximumFractionDigits: 2,
+  }).format(Number(amount))
+}
+
+function formatPercent(value: string | null): string {
+  if (value === null) return '—'
+  const number = Number(value)
+  return `${number >= 0 ? '+' : ''}${number.toFixed(2)}%`
+}
+
+export default function App() {
+  const [coinId, setCoinId] = useState(COINS[0].id)
+  const [currency, setCurrency] = useState('EUR')
+
+  const [currencies, setCurrencies] = useState<Currency[]>([])
+  const [snapshot, setSnapshot] = useState<MarketSnapshot | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    const controller = new AbortController()
+
+    fetchCurrencies(controller.signal)
+      .then((all) => setCurrencies(all.filter((one) => one.code !== BASE_CURRENCY)))
+      .catch((err: unknown) => {
+        if (isAbort(err)) return
+        setError(message(err))
+      })
+
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+
+    setIsLoading(true)
+    setError(null)
+
+    fetchMarketSnapshot(coinId, currency, controller.signal)
+      .then(setSnapshot)
+      .catch((err: unknown) => {
+        if (isAbort(err)) return
+        setSnapshot(null)
+        setError(message(err))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setIsLoading(false)
+      })
+
+    return () => controller.abort()
+  }, [coinId, currency])
+
+  const price = snapshot?.cryptoPrice
+  const converted = price?.converted[0]
+
+  return (
+    <main>
+      <h1>Market snapshot</h1>
+
+      <form className="controls">
+        <label>
+          Cryptocurrency
+          <select value={coinId} onChange={(event) => setCoinId(event.target.value)}>
+            {COINS.map((coin) => (
+              <option key={coin.id} value={coin.id}>
+                {coin.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          Convert to
+          <select
+            value={currency}
+            onChange={(event) => setCurrency(event.target.value)}
+            disabled={currencies.length === 0}
+          >
+            {currencies.map((one) => (
+              <option key={one.code} value={one.code}>
+                {one.code} — {one.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {isLoading && <span className="status">Updating…</span>}
+      </form>
+
+      {error && <p role="alert">Could not load market data: {error}</p>}
+
+      {!error && !price && !isLoading && <p role="alert">No price found for “{coinId}”.</p>}
+
+      {price && (
+        <table>
+          <thead>
+            <tr>
+              <th>Coin</th>
+              <th>Rate date</th>
+              <th>Price ({BASE_CURRENCY})</th>
+              <th>24h change</th>
+              <th>Price ({converted?.currency ?? currency})</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>{price.id}</td>
+              <td>{snapshot?.exchangeRates?.date ?? '—'}</td>
+              <td className="numeric">{formatMoney(price.price, BASE_CURRENCY)}</td>
+              <td className={`numeric ${Number(price.change24hPercent ?? 0) < 0 ? 'down' : 'up'}`}>
+                {formatPercent(price.change24hPercent)}
+              </td>
+              <td className="numeric">
+                {converted ? formatMoney(converted.price, converted.currency) : '—'}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      )}
+    </main>
+  )
+}
