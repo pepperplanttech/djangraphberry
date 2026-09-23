@@ -44,6 +44,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.http.ConditionalGetMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -139,3 +140,16 @@ REST_FRAMEWORK = {
     "ALLOWED_VERSIONS": ["v1"],
     "EXCEPTION_HANDLER": "markets.exceptions.problem_details_handler",
 }
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "djangraphberry",
+    }
+}
+
+# How long each kind of upstream response stays fresh.
+CURRENCIES_CACHE_SECONDS = 60 * 60 * 24   # the supported-currency list is near-static
+EXCHANGE_RATE_CACHE_SECONDS = 60 * 60     # ECB publishes once per working day
+CRYPTO_CACHE_SECONDS = 60                 # CoinGecko's own data is ~1 minute fresh
+NOT_FOUND_CACHE_SECONDS = 30              # brief, so a bad id can't hammer upstream

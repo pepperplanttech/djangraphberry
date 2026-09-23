@@ -2,6 +2,7 @@
 
 Everything else in the project calls these functions, never httpx directly.
 """
+from .cache import cached
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -9,14 +10,7 @@ from decimal import Decimal
 import httpx
 from django.conf import settings
 
-
-class UpstreamError(Exception):
-    """The upstream API was unreachable or returned an error."""
-
-
-class NotFoundError(Exception):
-    """The requested resource doesn't exist upstream."""
-
+from .exceptions import NotFoundError, UpstreamError
 
 @dataclass(frozen=True)
 class ExchangeRates:
@@ -51,12 +45,13 @@ def _get_json(base_url: str, path: str, params: dict | None = None):
 
 
 # --- Frankfurter (fiat exchange rates) ---
-
+@cached("CURRENCIES_CACHE_SECONDS")
 def fetch_currencies() -> dict[str, str]:
     """Return {"USD": "United States Dollar", ...}."""
     return _get_json(settings.FRANKFURTER_BASE_URL, "/currencies")
 
 
+@cached("EXCHANGE_RATE_CACHE_SECONDS")
 def fetch_latest_rates(base: str = "EUR", symbols: list[str] | None = None) -> ExchangeRates:
     params = {"base": base.upper()}
     if symbols:
@@ -71,7 +66,7 @@ def fetch_latest_rates(base: str = "EUR", symbols: list[str] | None = None) -> E
 
 
 # --- CoinGecko (crypto prices) ---
-
+@cached("CRYPTO_CACHE_SECONDS")
 def fetch_crypto_price(coin_id: str, currency: str = "usd") -> CryptoPrice:
     coin_id, currency = coin_id.lower(), currency.lower()
     data = _get_json(

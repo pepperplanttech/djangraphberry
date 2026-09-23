@@ -2,14 +2,17 @@ from rest_framework import status
 from rest_framework.exceptions import APIException
 from rest_framework.views import exception_handler
 
-from .clients import UpstreamError
-
 
 class UpstreamUnavailable(APIException):
     status_code = status.HTTP_502_BAD_GATEWAY
     default_detail = "An upstream data provider is unavailable. Try again later."
     default_code = "upstream_unavailable"
 
+class UpstreamError(Exception):
+    """The upstream API was unreachable or returned an error."""
+
+class NotFoundError(Exception):
+    """The requested resource doesn't exist upstream."""
 
 def problem_details_handler(exc, context):
     """Render every API error as RFC 9457 problem details."""

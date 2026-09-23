@@ -1,8 +1,8 @@
+from .cache import CacheControlMixin
 from rest_framework import viewsets
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
 from . import clients
 from .serializers import (
     CryptoPriceQuerySerializer,
@@ -13,9 +13,10 @@ from .serializers import (
 )
 
 
-class CurrencyViewSet(viewsets.ViewSet):
+class CurrencyViewSet(CacheControlMixin, viewsets.ViewSet):
     """Fiat currencies supported for exchange rates (source: Frankfurter / ECB)."""
 
+    cache_seconds_setting = "CURRENCIES_CACHE_SECONDS"
     lookup_field = "code"
     lookup_value_regex = "[A-Za-z]{3}"
 
@@ -32,8 +33,10 @@ class CurrencyViewSet(viewsets.ViewSet):
         return Response(CurrencySerializer({"code": code, "name": currencies[code]}).data)
 
 
-class LatestExchangeRatesView(APIView):
+class LatestExchangeRatesView(CacheControlMixin, APIView):
     """Latest ECB reference rates for a base currency (source: Frankfurter)."""
+
+    cache_seconds_setting = "EXCHANGE_RATE_CACHE_SECONDS"
 
     def get(self, request, **kwargs):
         query = ExchangeRatesQuerySerializer(data=request.query_params)
@@ -46,11 +49,13 @@ class LatestExchangeRatesView(APIView):
         return Response(ExchangeRatesSerializer(rates).data)
 
 
-class CryptocurrencyViewSet(viewsets.ViewSet):
+class CryptocurrencyViewSet(CacheControlMixin, viewsets.ViewSet):
     """Current price of a cryptocurrency (source: CoinGecko)."""
 
+    cache_seconds_setting = "CRYPTO_CACHE_SECONDS"
     lookup_field = "coin_id"
     lookup_value_regex = "[a-z0-9-]+"
+
 
     def retrieve(self, request, coin_id=None, **kwargs):
         query = CryptoPriceQuerySerializer(data=request.query_params)
