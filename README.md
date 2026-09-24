@@ -2,6 +2,8 @@
 
 A Django service that aggregates two public financial data sources behind a single API, exposed as both a versioned REST interface and a GraphQL endpoint, with a React client. Every lookup it answers is recorded to PostgreSQL. Everything runs locally with Docker Compose.
 
+> **Development use only.** The REST and GraphQL APIs are unauthenticated (DRF `AllowAny`, CSRF-exempt `/graphql/`), have no rate limiting, and run on Django's development server with `DJANGO_DEBUG=1` in the example environment. Do not expose this service to an untrusted network as-is.
+
 ## What it does
 
 The service wraps two upstream providers and normalizes their responses:
@@ -310,3 +312,7 @@ Neither provider requires an API key. CoinGecko's keyless tier is rate limited a
 - `400` rather than `404` when the crypto endpoint receives an unsupported `?currency=`.
 - A retention policy for the audit table, since it grows without bound.
 - Exchange-rate lookups in the audit log; only crypto lookups are recorded today, because those are what the client table shows.
+
+## License
+
+[MIT](LICENSE)
